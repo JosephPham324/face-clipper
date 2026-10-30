@@ -1,15 +1,17 @@
 #!/usr/bin/env py
 """
 Face Clipper & Manga Stylizer
-Detects faces in images, removes the background into a transparent cutout,
-crops to PNG, and converts the face into manga art style.
+Detects faces and full body subjects in images, removes the background into a transparent cutout,
+crops to PNG, and converts the subject into manga art style.
 
 Usage:
     py face_clipper.py <image_or_directory> [options]
 
 Examples:
     py face_clipper.py portrait.jpg
-    py face_clipper.py ./photos/ -o ./manga_cutouts/
+    py face_clipper.py portrait.jpg --full-body
+    py face_clipper.py portrait.jpg --both
+    py face_clipper.py ./photos/ -o ./manga_cutouts/ --full-body
     py face_clipper.py photo.png --style gray
     py face_clipper.py photo.png --style screentone
     py face_clipper.py photo.png --keep-bg
@@ -114,6 +116,95 @@ def crop_face(img: np.ndarray, bbox, padding: float = 0.35) -> np.ndarray:
     y2 = min(img_h, y + h + pad_h)
 
     return img[y1:y2, x1:x2].copy()
+
+
+def crop_region(img: np.ndarray, bbox, padding: float = 0.08) -> tuple:
+    """
+    Crops a rectangular region from img with proportional padding clamped within dimensions.
+    Returns:
+        (cropped_img, (x1, y1, x2, y2))
+    """
+    x, y, w, h = bbox
+    img_h, img_w = img.shape[:2]
+
+    pad_w = int(w * padding)
+    pad_h = int(h * padding)
+
+    x1 = max(0, x - pad_w)
+    y1 = max(0, y - pad_h)
+    x2 = min(img_w, x + w + pad_w)
+    y2 = min(img_h, y + h + pad_h)
+
+    return img[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+
+
+def extract_body_boxes(alpha: np.ndarray, min_area_ratio: float = 0.01) -> list:
+    """
+    Finds bounding boxes for body subjects from the foreground alpha mask.
+    Filters small noise components and returns a sorted list of bounding boxes:
+    [(x, y, w, h), ...] (sorted left-to-right).
+    """
+    h, w = alpha.shape[:2]
+    _, binary = cv2.threshold(alpha, 15, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned)
+    min_area = int(h * w * min_area_ratio)
+
+    boxes = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            bx = int(stats[i, cv2.CC_STAT_LEFT])
+            by = int(stats[i, cv2.CC_STAT_TOP])
+            bw = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            boxes.append((bx, by, bw, bh))
+
+    if not boxes:
+        # Fallback to non-zero alpha bounding box if no component meets threshold
+        y_idx, x_idx = np.where(alpha > 10)
+        if len(x_idx) > 0 and len(y_idx) > 0:
+            bx1, bx2 = int(x_idx.min()), int(x_idx.max())
+            by1, by2 = int(y_idx.min()), int(y_idx.max())
+            bw = bx2 - bx1
+            bh = by2 - by1
+            if bw > 10 and bh > 10:
+                boxes.append((bx1, by1, bw, bh))
+
+    boxes.sort(key=lambda b: (b[0], b[1]))
+    return boxes
+
+
+def estimate_body_boxes_from_faces(img_shape: tuple, faces: list, padding: float = 0.1) -> list:
+    """
+    Estimates full body bounding boxes based on detected face positions (used when keeping background).
+    """
+    img_h, img_w = img_shape[:2]
+    if not faces:
+        return [(0, 0, img_w, img_h)]
+
+    boxes = []
+    for (fx, fy, fw, fh) in faces:
+        pad_top = int(fh * 0.3)
+        top = max(0, fy - pad_top)
+        bottom = min(img_h, fy + int(fh * 7.5))
+
+        center_x = fx + fw // 2
+        half_width = int(fw * 1.6)
+        left = max(0, center_x - half_width)
+        right = min(img_w, center_x + half_width)
+
+        bw = right - left
+        bh = bottom - top
+
+        if bw >= 0.75 * img_w and bh >= 0.75 * img_h:
+            boxes.append((0, 0, img_w, img_h))
+        else:
+            boxes.append((left, top, bw, bh))
+
+    boxes.sort(key=lambda b: (b[0], b[1]))
+    return boxes
 
 
 def remove_background(crop_bgr: np.ndarray, session) -> tuple:
@@ -256,20 +347,23 @@ def process_image(
     rembg_session,
     style: str = "cel",
     padding: float = 0.35,
+    body_padding: float = 0.08,
     min_size: int = 40,
     dot_size: int = 6,
     remove_bg: bool = True,
     white_bg: bool = False,
+    full_body: bool = False,
+    both: bool = False,
     verbose: bool = True
 ) -> int:
     """
     Processes a single image:
-      1. Detects faces.
-      2. Crops face with proportional padding.
-      3. Removes background (transparent cutout).
-      4. Stylizes face in chosen manga style.
+      1. Detects faces and/or full body subjects.
+      2. Crops target region with proportional padding.
+      3. Removes background (transparent cutout) if remove_bg is True.
+      4. Stylizes subject in chosen manga style.
       5. Saves to PNG (transparent RGBA or solid white background).
-    Returns the number of faces extracted.
+    Returns the total number of cutouts extracted and saved.
     """
     img = read_image_safe(image_path)
     if img is None:
@@ -277,56 +371,119 @@ def process_image(
             print(f"[!] Could not read image: {image_path}")
         return 0
 
+    img_h, img_w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    base_name = image_path.stem
+    total_saved = 0
+
+    do_extract_body = full_body or both
+    do_extract_face = (not full_body) or both
+
+    # Detect faces
     faces = detect_faces(gray, min_size=min_size)
 
-    if not faces:
+    # In face-only mode, if no faces found, skip
+    if do_extract_face and not do_extract_body and not faces:
         if verbose:
             print(f"[-] No faces detected in: {image_path.name}")
         return 0
 
-    base_name = image_path.stem
-    faces_saved = 0
+    full_bgr_cleaned = None
+    full_alpha = None
 
-    for i, bbox in enumerate(faces, start=1):
-        face_crop = crop_face(img, bbox, padding=padding)
-        if face_crop.size == 0:
-            continue
-
+    # Full body extraction
+    if do_extract_body:
         if remove_bg:
-            # Segment human head and remove background
-            face_cleaned, alpha = remove_background(face_crop, rembg_session)
+            full_bgr_cleaned, full_alpha = remove_background(img, rembg_session)
+            nonzero_count = np.count_nonzero(full_alpha > 10)
+            if nonzero_count < int(img_h * img_w * 0.005):
+                if verbose:
+                    print(f"[-] No body subject detected in: {image_path.name}")
+                body_boxes = []
+            else:
+                body_boxes = extract_body_boxes(full_alpha)
         else:
-            face_cleaned = face_crop
-            h, w = face_crop.shape[:2]
-            alpha = np.full((h, w), 255, dtype=np.uint8)
+            full_bgr_cleaned = img
+            full_alpha = np.full((img_h, img_w), 255, dtype=np.uint8)
+            body_boxes = estimate_body_boxes_from_faces((img_h, img_w), faces, padding=body_padding)
 
-        # Apply manga stylization to the foreground
-        manga_gray = stylize_manga(face_cleaned, style=style, dot_size=dot_size)
+        if not body_boxes and not do_extract_face:
+            return 0
 
-        # Output composition
-        if white_bg:
-            # Composite onto pure white background (3-channel BGR)
-            white_canvas = np.full_like(manga_gray, 255)
-            alpha_norm = alpha.astype(np.float32) / 255.0
-            out_img = (manga_gray.astype(np.float32) * alpha_norm + white_canvas * (1.0 - alpha_norm)).astype(np.uint8)
+        for bi, bbox in enumerate(body_boxes, start=1):
+            body_crop_bgr, (x1, y1, x2, y2) = crop_region(full_bgr_cleaned, bbox, padding=body_padding)
+            if body_crop_bgr.size == 0:
+                continue
+
+            body_crop_alpha = full_alpha[y1:y2, x1:x2]
+
+            # Apply manga stylization
+            manga_gray = stylize_manga(body_crop_bgr, style=style, dot_size=dot_size)
+
+            if white_bg:
+                white_canvas = np.full_like(manga_gray, 255)
+                alpha_norm = body_crop_alpha.astype(np.float32) / 255.0
+                out_img = (manga_gray.astype(np.float32) * alpha_norm + white_canvas * (1.0 - alpha_norm)).astype(np.uint8)
+            else:
+                out_img = cv2.merge([manga_gray, manga_gray, manga_gray, body_crop_alpha])
+
+            suffix = f"_fullbody{bi}" if len(body_boxes) > 1 else "_fullbody"
+            out_filename = f"{base_name}{suffix}.png"
+            out_path = output_dir / out_filename
+
+            if write_png_safe(out_path, out_img):
+                total_saved += 1
+                if verbose:
+                    w, h = out_img.shape[1], out_img.shape[0]
+                    bg_desc = "white background" if white_bg else ("transparent PNG" if remove_bg else "original background")
+                    print(f"  [+] Saved: {out_path.name} ({w}x{h} px, full body cutout, {bg_desc})")
+
+    # Face extraction
+    if do_extract_face:
+        if not faces:
+            if verbose and not do_extract_body:
+                print(f"[-] No faces detected in: {image_path.name}")
         else:
-            # Transparent PNG with alpha channel (4-channel BGRA)
-            out_img = cv2.merge([manga_gray, manga_gray, manga_gray, alpha])
+            for fi, bbox in enumerate(faces, start=1):
+                if full_bgr_cleaned is not None and full_alpha is not None:
+                    # Reuse full-image background removal
+                    face_cleaned = crop_face(full_bgr_cleaned, bbox, padding=padding)
+                    alpha = crop_face(full_alpha, bbox, padding=padding)
+                else:
+                    face_crop = crop_face(img, bbox, padding=padding)
+                    if face_crop.size == 0:
+                        continue
+                    if remove_bg:
+                        face_cleaned, alpha = remove_background(face_crop, rembg_session)
+                    else:
+                        face_cleaned = face_crop
+                        h, w = face_crop.shape[:2]
+                        alpha = np.full((h, w), 255, dtype=np.uint8)
 
-        # File naming: image_face1.png, image_face2.png, etc.
-        suffix = f"_cutout{i}" if len(faces) > 1 else "_cutout"
-        out_filename = f"{base_name}{suffix}.png"
-        out_path = output_dir / out_filename
+                if face_cleaned.size == 0:
+                    continue
 
-        if write_png_safe(out_path, out_img):
-            faces_saved += 1
-            if verbose:
-                w, h = out_img.shape[1], out_img.shape[0]
-                bg_desc = "white background" if white_bg else ("transparent PNG" if remove_bg else "original background")
-                print(f"  [+] Saved: {out_path.name} ({w}x{h} px, {bg_desc})")
+                manga_gray = stylize_manga(face_cleaned, style=style, dot_size=dot_size)
 
-    return faces_saved
+                if white_bg:
+                    white_canvas = np.full_like(manga_gray, 255)
+                    alpha_norm = alpha.astype(np.float32) / 255.0
+                    out_img = (manga_gray.astype(np.float32) * alpha_norm + white_canvas * (1.0 - alpha_norm)).astype(np.uint8)
+                else:
+                    out_img = cv2.merge([manga_gray, manga_gray, manga_gray, alpha])
+
+                suffix = f"_cutout{fi}" if len(faces) > 1 else "_cutout"
+                out_filename = f"{base_name}{suffix}.png"
+                out_path = output_dir / out_filename
+
+                if write_png_safe(out_path, out_img):
+                    total_saved += 1
+                    if verbose:
+                        w, h = out_img.shape[1], out_img.shape[0]
+                        bg_desc = "white background" if white_bg else ("transparent PNG" if remove_bg else "original background")
+                        print(f"  [+] Saved: {out_path.name} ({w}x{h} px, face cutout, {bg_desc})")
+
+    return total_saved
 
 
 def collect_image_files(input_path: Path):
@@ -355,7 +512,7 @@ def collect_image_files(input_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Detect faces in images, cut them out with transparent background, and stylize as manga art.",
+        description="Detect faces and full body subjects in images, cut them out with transparent background, and stylize as manga art.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Available styles:
@@ -367,7 +524,9 @@ Available styles:
 
 Examples:
   py face_clipper.py portrait.jpg
-  py face_clipper.py ./my_photos/ -o ./manga_crops/
+  py face_clipper.py portrait.jpg --full-body
+  py face_clipper.py portrait.jpg --both
+  py face_clipper.py ./my_photos/ -o ./manga_crops/ --full-body
   py face_clipper.py photo.jpg --style gray
   py face_clipper.py photo.jpg --style screentone
   py face_clipper.py photo.jpg --white-bg
@@ -383,7 +542,25 @@ Examples:
         "-o", "--output",
         type=str,
         default="output_faces",
-        help="Destination directory to save PNG face cutouts (default: './output_faces')."
+        help="Destination directory to save PNG cutouts (default: './output_faces')."
+    )
+    parser.add_argument(
+        "-b", "--full-body", "--body",
+        dest="full_body",
+        action="store_true",
+        help="Include and extract the full body cutout instead of cropping only the face."
+    )
+    parser.add_argument(
+        "--both",
+        action="store_true",
+        help="Extract both the face cutout and the full body cutout."
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["face", "body", "both"],
+        default=None,
+        help="Target cutout mode: 'face' (default), 'body', or 'both'."
     )
     parser.add_argument(
         "-s", "--style",
@@ -397,6 +574,12 @@ Examples:
         type=float,
         default=0.35,
         help="Proportional margin to pad around the face bounding box (default: 0.35)."
+    )
+    parser.add_argument(
+        "--body-padding",
+        type=float,
+        default=0.08,
+        help="Proportional margin to pad around the full body bounding box (default: 0.08 [8%%])."
     )
     parser.add_argument(
         "--keep-bg",
@@ -456,38 +639,62 @@ Examples:
             print("[!] Note: 'rembg' package not found. Running with background kept.")
             remove_bg = False
 
+    # Determine mode
+    if args.mode:
+        both = args.mode == "both"
+        full_body = args.mode in ("body", "both")
+    else:
+        both = args.both
+        full_body = args.full_body or both
+
+    if both:
+        mode_str = "Both (Face & Full Body)"
+    elif full_body:
+        mode_str = "Full Body"
+    else:
+        mode_str = "Face"
+
     bg_mode = "Solid White" if args.white_bg else ("Transparent PNG" if remove_bg else "Original Rectangular Background")
 
     print(f"=== Face Clipper & Manga Cutout ===")
     print(f"Input:       {input_path} ({len(images)} image{'s' if len(images) > 1 else ''})")
     print(f"Output dir:  {output_dir.resolve()}")
+    print(f"Target:      {mode_str}")
     print(f"Style:       {args.style}")
     print(f"Background:  {bg_mode}")
-    print(f"Padding:     {int(args.padding * 100)}%")
+    if full_body and not both:
+        print(f"Padding:     {int(args.body_padding * 100)}% (body)")
+    elif both:
+        print(f"Padding:     {int(args.padding * 100)}% (face) / {int(args.body_padding * 100)}% (body)")
+    else:
+        print(f"Padding:     {int(args.padding * 100)}% (face)")
     print("-----------------------------------")
 
-    total_faces = 0
+    total_cutouts = 0
     verbose = not args.quiet
 
     for img_path in images:
         if verbose and len(images) > 1:
             print(f"Processing {img_path.name}...")
-        faces_count = process_image(
+        count = process_image(
             image_path=img_path,
             output_dir=output_dir,
             rembg_session=rembg_session,
             style=args.style,
             padding=args.padding,
+            body_padding=args.body_padding,
             min_size=args.min_size,
             dot_size=args.dot_size,
             remove_bg=remove_bg,
             white_bg=args.white_bg,
+            full_body=full_body,
+            both=both,
             verbose=verbose
         )
-        total_faces += faces_count
+        total_cutouts += count
 
     print("-----------------------------------")
-    print(f"[OK] Complete! Extracted {total_faces} cutout{'s' if total_faces != 1 else ''} into '{output_dir}'.")
+    print(f"[OK] Complete! Extracted {total_cutouts} cutout{'s' if total_cutouts != 1 else ''} into '{output_dir}'.")
 
 
 if __name__ == "__main__":
