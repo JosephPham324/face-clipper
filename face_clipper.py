@@ -3,6 +3,7 @@
 Face Clipper & Manga Stylizer
 Detects faces and full body subjects in images, removes the background into a transparent cutout,
 crops to PNG, and converts the subject into manga art style.
+Also supports stylizing the full source image directly without cropping.
 
 Usage:
     py face_clipper.py <image_or_directory> [options]
@@ -11,6 +12,8 @@ Examples:
     py face_clipper.py portrait.jpg
     py face_clipper.py portrait.jpg --full-body
     py face_clipper.py portrait.jpg --both
+    py face_clipper.py photo.jpg --no-crop
+    py face_clipper.py photo.jpg --style-only --style screentone
     py face_clipper.py ./photos/ -o ./manga_cutouts/ --full-body
     py face_clipper.py photo.png --style gray
     py face_clipper.py photo.png --style screentone
@@ -354,15 +357,17 @@ def process_image(
     white_bg: bool = False,
     full_body: bool = False,
     both: bool = False,
+    no_crop: bool = False,
     verbose: bool = True
 ) -> int:
     """
     Processes a single image:
-      1. Detects faces and/or full body subjects.
-      2. Crops target region with proportional padding.
-      3. Removes background (transparent cutout) if remove_bg is True.
-      4. Stylizes subject in chosen manga style.
-      5. Saves to PNG (transparent RGBA or solid white background).
+      1. If no_crop is True, stylizes the full source image without cropping face or body.
+      2. Detects faces and/or full body subjects if face/body extraction is enabled.
+      3. Crops target region with proportional padding.
+      4. Removes background (transparent cutout) if remove_bg is True.
+      5. Stylizes subject in chosen manga style.
+      6. Saves to PNG (transparent RGBA or solid white background).
     Returns the total number of cutouts extracted and saved.
     """
     img = read_image_safe(image_path)
@@ -372,29 +377,60 @@ def process_image(
         return 0
 
     img_h, img_w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     base_name = image_path.stem
     total_saved = 0
 
+    do_style_full = no_crop
     do_extract_body = full_body or both
-    do_extract_face = (not full_body) or both
+    do_extract_face = (not full_body and not no_crop) or both
 
-    # Detect faces
+    full_bgr_cleaned = None
+    full_alpha = None
+
+    # 1. Full source image styling (no cropping)
+    if do_style_full:
+        if remove_bg:
+            full_bgr_cleaned, full_alpha = remove_background(img, rembg_session)
+            manga_gray = stylize_manga(full_bgr_cleaned, style=style, dot_size=dot_size)
+            if white_bg:
+                white_canvas = np.full_like(manga_gray, 255)
+                alpha_norm = full_alpha.astype(np.float32) / 255.0
+                out_img = (manga_gray.astype(np.float32) * alpha_norm + white_canvas * (1.0 - alpha_norm)).astype(np.uint8)
+            else:
+                out_img = cv2.merge([manga_gray, manga_gray, manga_gray, full_alpha])
+            bg_desc = "white background" if white_bg else "transparent PNG"
+        else:
+            manga_gray = stylize_manga(img, style=style, dot_size=dot_size)
+            out_img = cv2.merge([manga_gray, manga_gray, manga_gray])
+            bg_desc = "full source image"
+
+        out_filename = f"{base_name}_manga.png"
+        out_path = output_dir / out_filename
+
+        if write_png_safe(out_path, out_img):
+            total_saved += 1
+            if verbose:
+                w, h = out_img.shape[1], out_img.shape[0]
+                print(f"  [+] Saved: {out_path.name} ({w}x{h} px, stylized full image, {bg_desc})")
+
+        # If user only wanted uncropped full-image styling, exit early
+        if not do_extract_body and not do_extract_face:
+            return total_saved
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     faces = detect_faces(gray, min_size=min_size)
 
     # In face-only mode, if no faces found, skip
     if do_extract_face and not do_extract_body and not faces:
         if verbose:
             print(f"[-] No faces detected in: {image_path.name}")
-        return 0
+        return total_saved
 
-    full_bgr_cleaned = None
-    full_alpha = None
-
-    # Full body extraction
+    # 2. Full body extraction
     if do_extract_body:
         if remove_bg:
-            full_bgr_cleaned, full_alpha = remove_background(img, rembg_session)
+            if full_bgr_cleaned is None or full_alpha is None:
+                full_bgr_cleaned, full_alpha = remove_background(img, rembg_session)
             nonzero_count = np.count_nonzero(full_alpha > 10)
             if nonzero_count < int(img_h * img_w * 0.005):
                 if verbose:
@@ -408,7 +444,7 @@ def process_image(
             body_boxes = estimate_body_boxes_from_faces((img_h, img_w), faces, padding=body_padding)
 
         if not body_boxes and not do_extract_face:
-            return 0
+            return total_saved
 
         for bi, bbox in enumerate(body_boxes, start=1):
             body_crop_bgr, (x1, y1, x2, y2) = crop_region(full_bgr_cleaned, bbox, padding=body_padding)
@@ -438,7 +474,7 @@ def process_image(
                     bg_desc = "white background" if white_bg else ("transparent PNG" if remove_bg else "original background")
                     print(f"  [+] Saved: {out_path.name} ({w}x{h} px, full body cutout, {bg_desc})")
 
-    # Face extraction
+    # 3. Face extraction
     if do_extract_face:
         if not faces:
             if verbose and not do_extract_body:
@@ -512,7 +548,7 @@ def collect_image_files(input_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Detect faces and full body subjects in images, cut them out with transparent background, and stylize as manga art.",
+        description="Detect faces and full body subjects in images, cut them out with transparent background, and stylize as manga art. Can also stylize the full source image without cropping.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Available styles:
@@ -526,9 +562,11 @@ Examples:
   py face_clipper.py portrait.jpg
   py face_clipper.py portrait.jpg --full-body
   py face_clipper.py portrait.jpg --both
-  py face_clipper.py ./my_photos/ -o ./manga_crops/ --full-body
+  py face_clipper.py photo.jpg --no-crop
+  py face_clipper.py photo.jpg --style-only --style screentone
+  py face_clipper.py photo.jpg --no-crop --remove-bg
+  py face_clipper.py ./my_photos/ -o ./manga_crops/ --no-crop
   py face_clipper.py photo.jpg --style gray
-  py face_clipper.py photo.jpg --style screentone
   py face_clipper.py photo.jpg --white-bg
   py face_clipper.py photo.jpg --keep-bg
 """
@@ -556,11 +594,17 @@ Examples:
         help="Extract both the face cutout and the full body cutout."
     )
     parser.add_argument(
+        "-n", "--no-crop", "--full-image", "--style-only",
+        dest="no_crop",
+        action="store_true",
+        help="Apply manga styling to the full source image without cropping face or body."
+    )
+    parser.add_argument(
         "--mode",
         type=str,
-        choices=["face", "body", "both"],
+        choices=["face", "body", "both", "full", "no-crop", "style-only"],
         default=None,
-        help="Target cutout mode: 'face' (default), 'body', or 'both'."
+        help="Target cutout mode: 'face' (default), 'body', 'both', or 'no-crop' ('full'/'style-only')."
     )
     parser.add_argument(
         "-s", "--style",
@@ -585,6 +629,11 @@ Examples:
         "--keep-bg",
         action="store_true",
         help="Keep the rectangular background instead of removing it."
+    )
+    parser.add_argument(
+        "--remove-bg",
+        action="store_true",
+        help="Force background removal (even in --no-crop / --style-only mode)."
     )
     parser.add_argument(
         "--white-bg",
@@ -625,7 +674,35 @@ Examples:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    remove_bg = not args.keep_bg
+    # Determine mode
+    if args.mode:
+        mode_lower = args.mode.lower()
+        no_crop = mode_lower in ("full", "no-crop", "style-only")
+        both = mode_lower == "both"
+        full_body = mode_lower in ("body", "both")
+    else:
+        no_crop = args.no_crop
+        both = args.both
+        full_body = args.full_body or both
+
+    # Determine whether background removal is performed
+    if no_crop and not (args.full_body or args.both or (args.mode and args.mode in ("face", "body", "both"))):
+        # Pure full image mode: by default preserve original background unless --remove-bg is explicitly passed
+        remove_bg = args.remove_bg and not args.keep_bg
+        mode_str = "Full Source Image (No Cropping)"
+    elif both:
+        remove_bg = not args.keep_bg
+        mode_str = "Both (Face & Full Body)" + (" + Full Image" if no_crop else "")
+    elif full_body:
+        remove_bg = not args.keep_bg
+        mode_str = "Full Body" + (" + Full Image" if no_crop else "")
+    elif no_crop:
+        remove_bg = not args.keep_bg
+        mode_str = "Face + Full Image"
+    else:
+        remove_bg = not args.keep_bg
+        mode_str = "Face"
+
     rembg_session = None
 
     if remove_bg:
@@ -639,22 +716,14 @@ Examples:
             print("[!] Note: 'rembg' package not found. Running with background kept.")
             remove_bg = False
 
-    # Determine mode
-    if args.mode:
-        both = args.mode == "both"
-        full_body = args.mode in ("body", "both")
+    if args.white_bg:
+        bg_mode = "Solid White"
+    elif remove_bg:
+        bg_mode = "Transparent PNG"
+    elif no_crop and not full_body and not both:
+        bg_mode = "Original Source Background (Preserved)"
     else:
-        both = args.both
-        full_body = args.full_body or both
-
-    if both:
-        mode_str = "Both (Face & Full Body)"
-    elif full_body:
-        mode_str = "Full Body"
-    else:
-        mode_str = "Face"
-
-    bg_mode = "Solid White" if args.white_bg else ("Transparent PNG" if remove_bg else "Original Rectangular Background")
+        bg_mode = "Original Rectangular Background"
 
     print(f"=== Face Clipper & Manga Cutout ===")
     print(f"Input:       {input_path} ({len(images)} image{'s' if len(images) > 1 else ''})")
@@ -662,7 +731,9 @@ Examples:
     print(f"Target:      {mode_str}")
     print(f"Style:       {args.style}")
     print(f"Background:  {bg_mode}")
-    if full_body and not both:
+    if no_crop and not full_body and not both:
+        print(f"Padding:     None (Full uncropped image)")
+    elif full_body and not both:
         print(f"Padding:     {int(args.body_padding * 100)}% (body)")
     elif both:
         print(f"Padding:     {int(args.padding * 100)}% (face) / {int(args.body_padding * 100)}% (body)")
@@ -689,6 +760,7 @@ Examples:
             white_bg=args.white_bg,
             full_body=full_body,
             both=both,
+            no_crop=no_crop,
             verbose=verbose
         )
         total_cutouts += count

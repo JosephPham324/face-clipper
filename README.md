@@ -9,6 +9,7 @@ Outputs are exported directly as transparent PNG files ready to paste into graph
 ## Features
 
 - **Full Body & Face Clipping**: Extract headshots or complete full-body cutouts (`--full-body`) or both simultaneously (`--both`).
+- **Full Image Manga Stylization (No Cropping)**: Stylize entire images, manga panels, or photos into authentic manga art without cropping any faces or bodies (`--no-crop` / `--style-only`).
 - **Automatic Background Removal**: Uses AI segmentation (`rembg` with lightweight `u2netp`) to isolate the person, clothes, hair, and face with smooth antialiased edges on a transparent background.
 - **Manga & Anime Stylization**:
   - `cel` (**Default**): Clean anime/digital manga cel-shading with flat tones and crisp ink lineart (zero screentone dots).
@@ -57,19 +58,40 @@ py face_clipper.py portrait.jpg -b
 ```
 The resulting cutout is saved to `output_faces/portrait_fullbody.png`.
 
-### 3. Extract Both Face & Full Body Cutouts
+### 3. Full-Image Manga Stylization (No Cropping: `--no-crop` / `--style-only`)
+```powershell
+# Stylize an entire image or manga panel without cropping any faces or bodies
+py face_clipper.py photo.jpg --no-crop
+
+# Or using the short flag / aliases
+py face_clipper.py photo.jpg -n
+py face_clipper.py manga_panel.png --style-only
+
+# Combine with any manga style
+py face_clipper.py photo.jpg --style-only --style screentone
+py face_clipper.py photo.jpg --no-crop --style sketch
+
+# Optional: full-image transparent background cutout
+py face_clipper.py photo.jpg --no-crop --remove-bg
+```
+The resulting full-frame image is saved to `output_faces/<filename>_manga.png` with original resolution preserved.
+
+### 4. Extract Both Face & Full Body Cutouts
 ```powershell
 # Generate both face cutout and full body cutout in a single run
 py face_clipper.py portrait.jpg --both
 ```
 
-### 4. Batch Process a Folder of Photos
+### 5. Batch Process a Folder of Photos
 ```powershell
 # Batch process full-body manga cutouts for an entire folder
 py face_clipper.py ./my_photos/ -o ./manga_cutouts/ --full-body
+
+# Batch stylize all images in a folder without cropping
+py face_clipper.py ./my_photos/ -o ./manga_scenes/ --no-crop
 ```
 
-### 5. Alternative Manga Styles
+### 6. Alternative Manga Styles
 ```powershell
 # Smooth photographic grayscale + ink lines
 py face_clipper.py portrait.jpg --full-body --style gray
@@ -84,7 +106,7 @@ py face_clipper.py portrait.jpg --full-body --style sketch
 py face_clipper.py portrait.jpg --full-body --style noir
 ```
 
-### 6. Background Customization
+### 7. Background Customization
 ```powershell
 # Solid white background instead of transparent alpha
 py face_clipper.py portrait.jpg --full-body --white-bg
@@ -93,7 +115,7 @@ py face_clipper.py portrait.jpg --full-body --white-bg
 py face_clipper.py portrait.jpg --full-body --keep-bg
 ```
 
-### 7. Adjust Padding
+### 8. Adjust Padding
 ```powershell
 # Adjust face framing padding (default 35%)
 py face_clipper.py portrait.jpg --padding 0.45
@@ -112,12 +134,14 @@ py face_clipper.py portrait.jpg --full-body --body-padding 0.12
 | `--output` | `-o` | `output_faces` | Destination directory to save PNG cutouts |
 | `--full-body` | `-b`, `--body` | `False` | Extract full body cutout instead of cropping to face |
 | `--both` | | `False` | Extract both face and full body cutouts in one run |
-| `--mode` | | `face` | Target cutout mode: `face`, `body`, or `both` |
+| `--no-crop` | `-n`, `--style-only`, `--full-image` | `False` | Only apply manga styling to full source image without cropping |
+| `--mode` | | `face` | Target mode: `face`, `body`, `both`, `full` (`no-crop` / `style-only`) |
 | `--style` | `-s` | `cel` | Style: `cel`, `gray`, `screentone`, `sketch`, `noir` |
 | `--padding` | `-p` | `0.35` | Proportional padding around face bbox (0.35 = 35%) |
 | `--body-padding` | | `0.08` | Proportional margin around full body bbox (0.08 = 8%) |
 | `--white-bg` | | `False` | Render on solid white background instead of transparent alpha |
 | `--keep-bg` | | `False` | Keep original rectangular image background without cutout |
+| `--remove-bg` | | `False` | Force background removal (e.g. in `--no-crop` mode) |
 | `--min-size` | | `40` | Minimum face width/height in pixels to detect |
 | `--dot-size` | | `6` | Screentone dot size (for `screentone` style) |
 | `--quiet` | `-q` | `False` | Suppress per-file console progress messages |
@@ -127,27 +151,28 @@ py face_clipper.py portrait.jpg --full-body --body-padding 0.12
 ## Pipeline Overview
 
 ```
-                       Input Photo
-                            │
-             ┌──────────────┴──────────────┐
-             ▼                             ▼
-       [Face Mode]                  [Full Body Mode]
-             │                             │
-    Haar Cascade Detection                 │
-             │                             │
-    Face Bounding Box + Pad                │
-             │                             │
-             └──────────────┬──────────────┘
-                            ▼
-               rembg (u2netp) Segmentation
-                            │
-                            ▼
-              Alpha Matte & Foreground Crop
-                            │
-                            ▼
-                  Stylization Pipeline
-    (Bilateral Filter + Adaptive Ink Lineart + Manga Tones)
-                            │
-                            ▼
-            Export to Transparent PNG (BGRA)
+                                  Input Photo
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        ▼                        ▼
+         [Face Mode]            [Full Body Mode]        [No-Crop / Style-Only]
+              │                        │                        │
+     Haar Cascade Detection            │                        │
+              │                        │                        │
+     Face Bounding Box + Pad           │                        │
+              │                        │                        │
+              └───────────────┬────────┘                        │
+                              ▼                                 │
+                 rembg (u2netp) Segmentation                    │
+                              │                                 │
+                              ▼                                 │
+                Alpha Matte & Foreground Crop                   │
+                              │                                 │
+                              └───────────────┬─────────────────┘
+                                              ▼
+                                    Stylization Pipeline
+                      (Bilateral Filter + Adaptive Ink Lineart + Manga Tones)
+                                              │
+                                              ▼
+                                Export to PNG (_manga / _cutout)
 ```
